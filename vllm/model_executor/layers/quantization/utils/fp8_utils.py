@@ -838,6 +838,254 @@ def _w8a8_triton_block_scaled_mm(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@triton.jit
+def _w8a8_triton_block_scaled_mm_split_k_kernel(
+    A,
+    B,
+    P,
+    As,
+    Bs,
+    M,
+    N,
+    group_n: tl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_pm,
+    stride_pn,
+    stride_ps,
+    stride_As_m,
+    stride_As_k,
+    stride_Bs_k,
+    stride_Bs_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_K_TILES_PER_SPLIT: tl.constexpr,
+):
+    """Compute one K-aligned FP32 partial for a block-FP8 GEMM output tile."""
+    pid = tl.program_id(axis=0)
+    split_id = tl.program_id(axis=1)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    k_tile_start = split_id * NUM_K_TILES_PER_SPLIT
+    offs_k = k_tile_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptrs = A + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    As_ptrs = As + offs_am * stride_As_m + k_tile_start * stride_As_k
+    Bs_ptrs = Bs + (offs_bn // group_n) * stride_Bs_n + k_tile_start * stride_Bs_k
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k_tile in range(NUM_K_TILES_PER_SPLIT):
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
+        a_s = tl.load(As_ptrs)
+        b_s = tl.load(Bs_ptrs)
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+        As_ptrs += stride_As_k
+        Bs_ptrs += stride_Bs_k
+
+    offs_pm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    p_ptrs = P + offs_pm[:, None] * stride_pm + offs_bn[None, :] * stride_pn
+    p_ptrs += split_id * stride_ps
+    p_mask = (offs_pm[:, None] < M) & (offs_bn[None, :] < N)
+    tl.store(p_ptrs, accumulator, mask=p_mask)
+
+
+@triton.jit
+def _w8a8_triton_block_scaled_mm_reduce_split_k(
+    P,
+    C,
+    M,
+    N,
+    stride_pm,
+    stride_pn,
+    stride_ps,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Reduce FP32 split-K partials in split-id order and cast once."""
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_pm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_pn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    p_mask = (offs_pm[:, None] < M) & (offs_pn[None, :] < N)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for split_id in range(SPLIT_K):
+        p_ptrs = P + offs_pm[:, None] * stride_pm + offs_pn[None, :] * stride_pn
+        p_ptrs += split_id * stride_ps
+        accumulator += tl.load(p_ptrs, mask=p_mask, other=0.0)
+
+    if C.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        c = accumulator.to(tl.float16)
+    else:
+        c = accumulator.to(tl.float32)
+
+    c_ptrs = C + offs_pm[:, None] * stride_cm + offs_pn[None, :] * stride_cn
+    tl.store(c_ptrs, c, mask=p_mask)
+
+
+def _get_sm89_split_k_factor(
+    M: int,
+    N: int,
+    K: int,
+    block_size: list[int],
+    config: dict[str, int] | None = None,
+    device_capability: tuple[int, int] | None = None,
+    enabled: bool | None = None,
+    include_8192: bool | None = None,
+    is_cuda: bool | None = None,
+    batch_invariant: bool | None = None,
+) -> int | None:
+    """Return the experimental split factor for known small-M SM89 shapes.
+
+    K partitions must consist of whole quantization blocks, so activation and
+    weight scale lookups remain identical to the unsplit kernel.
+    """
+    if enabled is None:
+        enabled = envs.VLLM_ENABLE_SM89_FP8_SPLIT_K
+    if batch_invariant is None:
+        batch_invariant = envs.VLLM_BATCH_INVARIANT
+    if not enabled or batch_invariant:
+        return None
+    if device_capability is None:
+        device_capability = current_platform.get_device_capability()
+    if is_cuda is None:
+        is_cuda = current_platform.is_cuda()
+    if not is_cuda or device_capability != (8, 9):
+        return None
+    if not 1 <= M <= 32 or block_size != [128, 128]:
+        return None
+    if (N, K) == (8192, 5120):
+        if include_8192 is None:
+            include_8192 = envs.VLLM_ENABLE_SM89_FP8_SPLIT_K_N8192_K5120
+        if not include_8192:
+            return None
+    elif (N, K) not in {(5120, 8704), (5120, 3072)}:
+        return None
+    split_k = 4
+    if K % (split_k * block_size[1]) != 0:
+        return None
+    if config is not None and (
+        config["BLOCK_SIZE_K"] != block_size[1]
+        or N % config["BLOCK_SIZE_N"] != 0
+        or K % (split_k * config["BLOCK_SIZE_K"]) != 0
+    ):
+        return None
+    return split_k
+
+
+def _run_w8a8_triton_block_scaled_mm_split_k(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    M: int,
+    N: int,
+    block_n: int,
+    block_k: int,
+    config: dict[str, int],
+    split_k: int,
+) -> None:
+    """Launch the SM89 split-K chain for a contiguous output tensor."""
+    block_size_m = config["BLOCK_SIZE_M"]
+    block_size_n = config["BLOCK_SIZE_N"]
+    block_size_k = config["BLOCK_SIZE_K"]
+    assert block_size_k == block_k
+    assert N % block_size_n == 0
+    num_k_tiles = B.shape[1] // block_size_k
+    assert num_k_tiles % split_k == 0
+    partials = torch.empty((split_k, M, N), device=A.device, dtype=torch.float32)
+    C_2d = C.view(M, N)
+
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            split_k,
+        )
+
+    _w8a8_triton_block_scaled_mm_split_k_kernel[grid](
+        A,
+        B,
+        partials,
+        As,
+        Bs,
+        M,
+        N,
+        block_n,
+        A.stride(-2),
+        A.stride(-1),
+        B.stride(1),
+        B.stride(0),
+        partials.stride(1),
+        partials.stride(2),
+        partials.stride(0),
+        As.stride(-2),
+        As.stride(-1),
+        Bs.stride(1),
+        Bs.stride(0),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        NUM_K_TILES_PER_SPLIT=num_k_tiles // split_k,
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
+    )
+
+    def reduce_grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+    _w8a8_triton_block_scaled_mm_reduce_split_k[reduce_grid](
+        partials,
+        C_2d,
+        M,
+        N,
+        partials.stride(1),
+        partials.stride(2),
+        partials.stride(0),
+        C_2d.stride(0),
+        C_2d.stride(1),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        SPLIT_K=split_k,
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
+    )
+
+
 @functools.lru_cache
 def get_w8a8_block_fp8_configs(
     N: int, K: int, block_n: int, block_k: int
@@ -974,6 +1222,16 @@ def w8a8_triton_block_scaled_mm(
             "num_warps": 4,
             "num_stages": 2,
         }
+
+    # The split kernel deliberately maps one K tile to one quantization block.
+    # A tuned JSON config with a different K tile must use the established
+    # kernel until it has its own correctness/performance validation.
+    split_k = _get_sm89_split_k_factor(M, N, K, block_size, config=config)
+    if split_k is not None:
+        _run_w8a8_triton_block_scaled_mm_split_k(
+            A, B, C, As, Bs, M, N, block_n, block_k, config, split_k
+        )
+        return C
 
     def grid(META):
         return (

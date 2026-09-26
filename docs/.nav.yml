@@ -53,6 +53,7 @@ nav:
       - benchmarking/cli.md
       - benchmarking/sweeps.md
       - benchmarking/dashboard.md
+      - benchmarking/l40_sm89_block_fp8_split_k.md
   - API Reference:
     - api/README.md
     - api/vllm
