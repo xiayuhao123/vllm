@@ -5,13 +5,17 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.attn_utils import (
+    build_slot_mappings_by_layer,
+    init_attn_backend,
+)
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
@@ -19,6 +23,11 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
+)
+from vllm.v1.worker.gpu.spec_decode.autoregressive.independent_cudagraph import (
+    check_independent_decode_metadata,
+    exact_draft_graph_batch,
+    make_independent_mtp_decode_config,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
@@ -46,6 +55,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
+        self._independent_decode_config: VllmConfig | None = None
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -69,6 +79,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     def on_multi_step_decode_end(self, num_reqs: int) -> None: ...
 
     @property
+    def attn_vllm_config(self) -> VllmConfig:
+        return (
+            getattr(self, "_independent_decode_config", None)
+            or super().attn_vllm_config
+        )
+
+    @property
     def advance_draft_positions(self) -> bool:
         """Whether to increment positions and seq_lens between draft steps.
 
@@ -85,6 +102,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         target_input_buffers: InputBuffers,
         target_attn_groups: list[list[AttentionGroup]],
     ) -> None:
+        # Profiling and final allocation each construct fresh attention builders.
+        self._independent_decode_config = None
         super().set_attn(
             model_state,
             kv_cache_config,
@@ -92,7 +111,33 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             target_input_buffers,
             target_attn_groups,
         )
+        self._independent_decode_config, reason = make_independent_mtp_decode_config(
+            self.vllm_config,
+            backend_names={
+                group.backend.get_name()
+                for groups in self.attn_groups
+                for group in groups
+            },
+            min_cg_support=self.attn_cg_support.min_cg_support,
+        )
+        if self._independent_decode_config is not None:
+            self.attn_groups, self.attn_cg_support, _ = init_attn_backend(
+                kv_cache_config,
+                self.attn_vllm_config,
+                self.device,
+                active_layer_names=self.draft_attn_layer_names,
+            )
+            logger.info(
+                "Independent MTP decode CUDA Graph enabled: target=PIECEWISE, "
+                "draft=FULL_DECODE_ONLY, exact request counts=%s; "
+                "FlashInfer metadata planning remains outside graphs.",
+                self._independent_decode_config.compilation_config.cudagraph_capture_sizes,
+            )
+        elif envs.VLLM_ENABLE_SM89_MTP_DECODE_GRAPH:
+            logger.info("Independent MTP decode CUDA Graph skipped: %s.", reason)
         self._configure_fused_multi_step_decode()
+        if self._independent_decode_config is not None:
+            self.use_fused_multi_step_decode = False
 
     def _configure_fused_multi_step_decode(self) -> None:
         if self.num_speculative_steps == 1:
@@ -130,14 +175,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
-        if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+        decode_config = self.attn_vllm_config
+        if (
+            self._independent_decode_config is not None
+            or cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        ):
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
             cudagraph_mode = CUDAGraphMode.NONE
 
         # Initialize cudagraph manager for draft decodes (draft positions > 0).
         self.decode_cudagraph_manager = SpeculatorCudaGraphManager(
-            self.vllm_config, self.device, cudagraph_mode, decode_query_len=1
+            decode_config, self.device, cudagraph_mode, decode_query_len=1
         )
 
     def capture(self) -> None:
@@ -192,6 +241,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             progress_bar_desc="Capturing decode CUDA graphs",
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
+        if self._independent_decode_config is not None:
+            logger.info(
+                "Independent MTP decode CUDA Graph captured: request counts=%s.",
+                self.decode_cudagraph_manager.captured_token_counts(),
+            )
 
     @torch.inference_mode()
     def propose(
@@ -360,6 +414,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             need_eager=is_profile,
             dp_sync=decode_batch_sync,
         )
+        if self._independent_decode_config is not None:
+            decode_batch_desc = exact_draft_graph_batch(decode_batch_desc, num_reqs)
+            if decode_batch_desc.cg_mode != CUDAGraphMode.FULL:
+                logger.info_once(
+                    "Independent MTP decode CUDA Graph eager fallback: requests=%d.",
+                    num_reqs,
+                )
         num_tokens_across_dp = (
             decode_batch_sync.num_tokens_across_dp
             if decode_batch_sync is not None
@@ -537,6 +598,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 assert self.decode_cudagraph_manager is not None
+                if getattr(self, "_independent_decode_config", None) is not None:
+                    check_independent_decode_metadata(attn_metadata)
+                    logger.info_once(
+                        "Independent MTP decode CUDA Graph replay: "
+                        "requests=%d, step=%d.",
+                        num_reqs,
+                        step,
+                    )
                 self.decode_cudagraph_manager.run_fullgraph(batch_desc)
             else:
                 self._generate_draft(

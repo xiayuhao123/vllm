@@ -92,6 +92,10 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_ENABLE_SM89_FP8_SPLIT_K: bool = False
+    VLLM_ENABLE_SM89_FP8_SPLIT_K_N8192_K5120: bool = False
+    VLLM_ENABLE_SM89_MTP_DECODE_GRAPH: bool = False
+    VLLM_ENABLE_SM89_EXTRA_WARMUP: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -629,6 +633,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    "VLLM_ENABLE_SM89_FP8_SPLIT_K": lambda: (
+        os.environ.get("VLLM_ENABLE_SM89_FP8_SPLIT_K", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_ENABLE_SM89_FP8_SPLIT_K_N8192_K5120": lambda: (
+        os.environ.get("VLLM_ENABLE_SM89_FP8_SPLIT_K_N8192_K5120", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_ENABLE_SM89_MTP_DECODE_GRAPH": lambda: (
+        os.environ.get("VLLM_ENABLE_SM89_MTP_DECODE_GRAPH", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_ENABLE_SM89_EXTRA_WARMUP": lambda: (
+        os.environ.get("VLLM_ENABLE_SM89_EXTRA_WARMUP", "0").strip().lower()
+        in ("1", "true")
+    ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.sm89_warmup import sm89_extra_warmup_enabled
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -45,6 +46,7 @@ class _QwenGDNWarmupConfig:
     dt_bias: torch.Tensor
     state_stride_token: int
     state_dtype: torch.dtype
+    conv_weight_dtype: torch.dtype | None = None
 
     @property
     def conv_dim(self) -> int:
@@ -118,6 +120,7 @@ def _qwen_gdn_warmup_config(
         h = int(layer.num_k_heads) // tp_size
         hv = int(layer.num_v_heads) // tp_size
         norm = layer.norm
+        conv_weight = getattr(getattr(layer, "conv1d", None), "weight", None)
 
         return _QwenGDNWarmupConfig(
             h=h,
@@ -134,6 +137,9 @@ def _qwen_gdn_warmup_config(
             dt_bias=layer.dt_bias,
             state_stride_token=int(ssm_state.stride(0)),
             state_dtype=ssm_state.dtype,
+            conv_weight_dtype=(
+                conv_weight.dtype if isinstance(conv_weight, torch.Tensor) else None
+            ),
         )
 
     if found_layer:
@@ -200,6 +206,117 @@ def _warm_causal_conv1d_fwd_kernel(
         null_block_id=NULL_BLOCK_ID,
         metadata=None,
         validate_data=False,
+    )
+
+
+def _warm_causal_conv1d_update_kernel(
+    device: torch.device,
+    config: _QwenGDNWarmupConfig,
+    num_speculative_tokens: int,
+) -> None:
+    """Compile ordinary and varlen Qwen updates without touching live states."""
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        causal_conv1d_update,
+    )
+
+    # The kernels specialize all state strides. Clone/contiguous would lose the
+    # transposed cache layout or page padding used by the loaded model.
+    state = torch.empty_strided(
+        (17, *config.conv_state.shape[1:]),
+        config.conv_state.stride(),
+        dtype=config.conv_dtype,
+        device=device,
+    )
+    state.zero_()
+    weight_dtype = config.conv_weight_dtype or config.norm_weight_dtype
+    weight = torch.zeros(
+        (config.conv_dim, config.conv_kernel_size),
+        dtype=weight_dtype,
+        device=device,
+    )
+    row_strides = (config.conv_dim, config.conv_dim + config.hv * config.v)
+    launches = 0
+    for num_reqs in (1, 4, 16):
+        indices = torch.arange(1, num_reqs + 1, dtype=torch.int32, device=device)
+        for row_stride in row_strides:
+            x = torch.empty_strided(
+                (num_reqs, config.conv_dim),
+                (row_stride, 1),
+                dtype=weight_dtype,
+                device=device,
+            )
+            x.zero_()
+            causal_conv1d_update(
+                x,
+                state,
+                weight,
+                None,
+                "silu",
+                conv_state_indices=indices,
+                validate_data=False,
+            )
+            launches += 1
+
+    max_query_len = num_speculative_tokens + 1
+    if num_speculative_tokens > 0:
+        required_state_len = config.conv_kernel_size - 1 + num_speculative_tokens
+        if state.size(2) < required_state_len:
+            logger.info(
+                "Skipping speculative Qwen conv-update warmup: state length "
+                "%d is below required %d.",
+                state.size(2),
+                required_state_len,
+            )
+        else:
+            for num_reqs in (1, 4, 16):
+                # Qwen uses the first column of the speculative state table.
+                table = torch.ones(
+                    (num_reqs, max_query_len), dtype=torch.int32, device=device
+                )
+                table[:, 0] = torch.arange(
+                    1, num_reqs + 1, dtype=torch.int32, device=device
+                )
+                indices = table[:, 0]
+                accepted = torch.ones(num_reqs, dtype=torch.int32, device=device)
+                for variable_lengths in (False, True):
+                    lengths = [
+                        (i % max_query_len + 1) if variable_lengths else max_query_len
+                        for i in range(num_reqs)
+                    ]
+                    offsets = [0]
+                    for length in lengths:
+                        offsets.append(offsets[-1] + length)
+                    query_start_loc = torch.tensor(
+                        offsets, dtype=torch.int32, device=device
+                    )
+                    for row_stride in row_strides:
+                        x = torch.empty_strided(
+                            (offsets[-1], config.conv_dim),
+                            (row_stride, 1),
+                            dtype=weight_dtype,
+                            device=device,
+                        )
+                        x.zero_()
+                        causal_conv1d_update(
+                            x,
+                            state,
+                            weight,
+                            None,
+                            "silu",
+                            conv_state_indices=indices,
+                            num_accepted_tokens=accepted,
+                            query_start_loc=query_start_loc,
+                            max_query_len=max_query_len,
+                            validate_data=False,
+                        )
+                        launches += 1
+    logger.info(
+        "Warmed Qwen causal-conv1d update: "
+        "configured query length=%d, state strides=%s, launches=%d; "
+        "scratch states only.",
+        max_query_len,
+        config.conv_state.stride(),
+        launches,
     )
 
 
@@ -305,5 +422,12 @@ def qwen_triton_warmup(
     _warm_fused_post_conv_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.
     if not runner.is_pooling_model:
+        if sm89_extra_warmup_enabled():
+            spec = runner.speculative_config
+            _warm_causal_conv1d_update_kernel(
+                device,
+                gdn_config,
+                spec.num_speculative_tokens if spec is not None else 0,
+            )
         _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
     _synchronize_device(device)
