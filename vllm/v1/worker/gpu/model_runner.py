@@ -470,20 +470,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "reasoning_config": self.vllm_config.reasoning_config,
                 "return_sampling_mask": self.model_config.return_sampling_mask,
             }
-            if self.vllm_config.watermark_config is None:
-                self.sampler = Sampler(**sampler_kwargs)
-            else:
-                wm_config = self.vllm_config.watermark_config
-                watermarker = create_watermarker(wm_config)
-                if self.speculative_config is not None:
-                    watermarker = create_speculative_target_watermarker(watermarker)
-                self.sampler = GPUWatermarkSampler(
-                    watermarker,
-                    deduplicate_contexts=wm_config.deduplicate_contexts,
-                    deduplicate_contexts_max_history=(
-                        wm_config.deduplicate_contexts_max_history
-                    ),
-                    **sampler_kwargs,
+            num_sampler_warmups_before = len(self.jit_warmup_registry)
+            with self.jit_warmup_registry.activate():
+                if self.vllm_config.watermark_config is None:
+                    self.sampler = Sampler(**sampler_kwargs)
+                else:
+                    wm_config = self.vllm_config.watermark_config
+                    watermarker = create_watermarker(wm_config)
+                    if self.speculative_config is not None:
+                        watermarker = create_speculative_target_watermarker(watermarker)
+                    self.sampler = GPUWatermarkSampler(
+                        watermarker,
+                        deduplicate_contexts=wm_config.deduplicate_contexts,
+                        deduplicate_contexts_max_history=(
+                            wm_config.deduplicate_contexts_max_history
+                        ),
+                        **sampler_kwargs,
+                    )
+            num_sampler_warmups = (
+                len(self.jit_warmup_registry) - num_sampler_warmups_before
+            )
+            if num_sampler_warmups:
+                logger.info(
+                    "Registered %d V2 sampler JIT warmup providers "
+                    "(including native top-k/top-p fallbacks).",
+                    num_sampler_warmups,
                 )
             custom = self.model_state.custom_sampler(self.sampler)
 

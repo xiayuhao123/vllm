@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_ENABLE_SM89_FP8_SPLIT_K: bool = False
     VLLM_ENABLE_SM89_FP8_SPLIT_K_N8192_K5120: bool = False
+    VLLM_ENABLE_SM89_MTP_DECODE_GRAPH: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -625,6 +626,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ENABLE_SM89_FP8_SPLIT_K_N8192_K5120": lambda: (
         os.environ.get("VLLM_ENABLE_SM89_FP8_SPLIT_K_N8192_K5120", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_ENABLE_SM89_MTP_DECODE_GRAPH": lambda: (
+        os.environ.get("VLLM_ENABLE_SM89_MTP_DECODE_GRAPH", "0").strip().lower()
         in ("1", "true")
     ),
     "VLLM_REPLICATE_EMBED": lambda: (

@@ -12,6 +12,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
     flashinfer_sample,
     flashinfer_sampler_supported,
+    register_top_k_top_p_warmups,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
@@ -64,6 +65,9 @@ class Sampler:
         self.use_flashinfer = (
             not return_sampling_mask and flashinfer_sampler_supported()
         )
+        # Rejection sampling and seeded requests can use native filtering even
+        # when ordinary requests use FlashInfer.
+        register_top_k_top_p_warmups()
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams

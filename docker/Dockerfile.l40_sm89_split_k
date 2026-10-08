@@ -10,7 +10,7 @@ FROM ${BASE_IMAGE}
 USER root
 
 # A mismatched base image would mix Python with different compiled ops.
-RUN python -c 'from importlib.metadata import version; v = version("vllm"); raise SystemExit(0 if v == "0.30.0" else f"Expected vLLM 0.30.0, got {v}")'
+RUN python3 -c 'from importlib.metadata import version; v = version("vllm"); raise SystemExit(0 if v == "0.30.0" else f"Expected vLLM 0.30.0, got {v}")'
 
 # Keep the prebuilt vLLM CUDA extensions from BASE_IMAGE. These are the only
 # runtime Python modules changed by the experimental SM89 split-K patch.
@@ -21,11 +21,11 @@ COPY benchmarks/kernels/benchmark_l40_sm89_block_fp8_split_k.py \
     /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py
 
 RUN set -eux; \
-    VLLM_PYTHON_DIR="$(python -c 'import importlib.util; print(next(iter(importlib.util.find_spec("vllm").submodule_search_locations)))')"; \
+    VLLM_PYTHON_DIR="$(python3 -c 'import importlib.util; print(next(iter(importlib.util.find_spec("vllm").submodule_search_locations)))')"; \
     test -f "$VLLM_PYTHON_DIR/model_executor/layers/quantization/utils/fp8_utils.py"; \
     cp /tmp/l40-sm89/vllm/envs.py "$VLLM_PYTHON_DIR/envs.py"; \
     cp /tmp/l40-sm89/vllm/model_executor/layers/quantization/utils/fp8_utils.py \
         "$VLLM_PYTHON_DIR/model_executor/layers/quantization/utils/fp8_utils.py"; \
-    python -m py_compile "$VLLM_PYTHON_DIR/envs.py" \
+    python3 -m py_compile "$VLLM_PYTHON_DIR/envs.py" \
         "$VLLM_PYTHON_DIR/model_executor/layers/quantization/utils/fp8_utils.py" \
         /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py

@@ -42,10 +42,10 @@ and module path, checks output against the original kernel, then compares the
 full kernel chain, including the FP32 partial buffer and reduction:
 
 ```bash
-python /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py --m 4 --shape mlp --check-only
-python /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py --m 4 --shape mlp
-python /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py --m 4 --shape gdn
-python /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py --m 4 --shape n8192
+python3 /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py --m 4 --shape mlp --check-only
+python3 /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py --m 4 --shape mlp
+python3 /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py --m 4 --shape gdn
+python3 /opt/vllm-l40/benchmark_l40_sm89_block_fp8_split_k.py --m 4 --shape n8192
 ```
 
 It does not predict end-to-end decode gains: all-reduce, attention/GDN kernels,

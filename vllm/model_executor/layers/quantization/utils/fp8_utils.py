@@ -1228,6 +1228,18 @@ def w8a8_triton_block_scaled_mm(
     # kernel until it has its own correctness/performance validation.
     split_k = _get_sm89_split_k_factor(M, N, K, block_size, config=config)
     if split_k is not None:
+        logger.info_once(
+            "SM89 FP8 split-K selected: M=%d, N=%d, K=%d, split_k=%d, "
+            "tile=(%d,%d,%d). May be selected during warmup/capture; "
+            "this is not a runtime invocation counter.",
+            M,
+            N,
+            K,
+            split_k,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+        )
         _run_w8a8_triton_block_scaled_mm_split_k(
             A, B, C, As, Bs, M, N, block_n, block_k, config, split_k
         )
