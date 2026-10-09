@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_SM89_FP8_SPLIT_K: bool = False
     VLLM_ENABLE_SM89_FP8_SPLIT_K_N8192_K5120: bool = False
     VLLM_ENABLE_SM89_FP8_TUNING: bool = False
+    VLLM_ENABLE_DFLASH2_PREFIX_CACHE: bool = False
     VLLM_ENABLE_SM89_MTP_DECODE_GRAPH: bool = False
     VLLM_ENABLE_SM89_EXTRA_WARMUP: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
@@ -645,6 +646,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_SM89_FP8_TUNING": lambda: (
         os.environ.get("VLLM_ENABLE_SM89_FP8_TUNING", "0").strip().lower()
         in ("1", "true")
+    ),
+    # Opt-in exact Qwen DFlash2 draft group annotation for prefix reuse.
+    "VLLM_ENABLE_DFLASH2_PREFIX_CACHE": lambda: (
+        os.environ.get("VLLM_ENABLE_DFLASH2_PREFIX_CACHE", "0").strip().lower()
+        in ("1", "true", "yes")
     ),
     "VLLM_ENABLE_SM89_MTP_DECODE_GRAPH": lambda: (
         os.environ.get("VLLM_ENABLE_SM89_MTP_DECODE_GRAPH", "0").strip().lower()

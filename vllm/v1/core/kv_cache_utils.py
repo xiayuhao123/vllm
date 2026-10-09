@@ -2167,6 +2167,50 @@ def _groups_partition_layers_exactly(
     return len(names) == len(kv_cache_spec) and set(names) == set(kv_cache_spec)
 
 
+def _dflash2_draft_layer_names(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> set[str]:
+    """Identify the complete layer range registered by DFlashQwen3ForCausalLM."""
+    spec_config = vllm_config.speculative_config
+    if (
+        not envs.VLLM_ENABLE_DFLASH2_PREFIX_CACHE
+        or spec_config is None
+        or spec_config.method != "dflash"
+        or not _groups_partition_layers_exactly(kv_cache_spec, kv_cache_groups)
+    ):
+        return set()
+    draft_config = getattr(spec_config, "draft_model_config", None)
+    if draft_config is None or draft_config.architectures != ["DFlash2DraftModel"]:
+        return set()
+    target_count = vllm_config.model_config.get_total_num_hidden_layers()
+    draft_count = getattr(draft_config.hf_config, "num_hidden_layers", None)
+    if (
+        type(target_count) is not int
+        or type(draft_count) is not int
+        or target_count <= 0
+        or draft_count <= 0
+    ):
+        return set()
+    names = {
+        f"model.layers.{i}.self_attn.attn"
+        for i in range(target_count, target_count + draft_count)
+    }
+    if any(not isinstance(kv_cache_spec.get(name), AttentionSpec) for name in names):
+        return set()
+    if any(
+        names.intersection(group.layer_names)
+        and any(
+            isinstance(spec, MambaSpec)
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
+        for group in kv_cache_groups
+    ):
+        return set()
+    return names
+
+
 def _annotate_eagle_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -2175,7 +2219,7 @@ def _annotate_eagle_groups(
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
-    Two detection rules, in order of preference:
+    Detection rules:
 
     1. Spec-driven. ``non_causal_multi_token_decode`` is declared on
        MLAAttentionSpec and set by drafter attention layers that run a
@@ -2184,7 +2228,9 @@ def _annotate_eagle_groups(
        spec merging, wherever grouping happens to land. It is sufficient but
        not necessary: a drafter whose spec is indistinguishable from the
        target's cannot be found this way.
-    2. Positional fallback for MTP drafters (including DeepseekV4/V4.1 DSpark), whose
+    2. Opt-in DFlash2 detection validates the complete registered draft layer
+       range against the original specs and exact group partition.
+    3. Positional fallback for MTP drafters (including DeepseekV4/V4.1 DSpark), whose
        MTP block reuses the target's own decoder layer and so carries no spec
        marker. Their draft attention layers always register after every
        target layer, so flag whichever group holds the last registered layer.
@@ -2197,9 +2243,9 @@ def _annotate_eagle_groups(
     Args:
         vllm_config: Config supplying the speculative method, if any.
         kv_cache_spec: The kv cache spec of each attention layer, in layer
-            registration order. Only read by rule 2.
+            registration order. Read by rules 2 and 3.
         kv_cache_groups: Groups to annotate in place.
-        use_trailing_layer_fallback: Enable rule 2. Callers gate this on
+        use_trailing_layer_fallback: Enable rule 3. Callers gate this on
             ``_uses_trailing_mtp_layers``.
 
     """
@@ -2213,6 +2259,22 @@ def _annotate_eagle_groups(
             for spec in iter_layer_specs(group.kv_cache_spec)
         ):
             group.is_eagle_group = True
+
+    dflash_names = _dflash2_draft_layer_names(
+        vllm_config, kv_cache_spec, kv_cache_groups
+    )
+    if dflash_names:
+        draft_group_ids = []
+        for group_id, group in enumerate(kv_cache_groups):
+            if dflash_names.intersection(group.layer_names):
+                group.is_eagle_group = True
+                draft_group_ids.append(group_id)
+        logger.info_once(
+            "DFlash2 prefix-cache draft groups identified: layers=%d, groups=%s; "
+            "draft-tail protection remains enabled.",
+            len(dflash_names),
+            tuple(draft_group_ids),
+        )
 
     if not use_trailing_layer_fallback:
         return

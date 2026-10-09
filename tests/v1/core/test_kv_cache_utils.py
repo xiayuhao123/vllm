@@ -4629,6 +4629,138 @@ def test_no_warning_when_draft_group_is_identified(caplog_vllm):
     assert "could be identified as the draft model's" not in caplog_vllm.text
 
 
+def _dflash2_prefix_group_case():
+    config = _spec_decode_grouping_config(method="dflash", model_type="qwen3_5")
+    config.model_config.get_total_num_hidden_layers = lambda: 8
+    config.speculative_config.draft_model_config = SimpleNamespace(
+        architectures=["DFlash2DraftModel"],
+        hf_config=SimpleNamespace(num_hidden_layers=5),
+    )
+    mamba_name = "model.language_model.layers.0.linear_attn"
+    target_name = "model.language_model.layers.3.self_attn.attn"
+    draft_names = [f"model.layers.{i}.self_attn.attn" for i in range(8, 13)]
+    mamba = new_mamba_spec(mamba_cache_mode="align")
+    attention = new_kv_cache_spec()
+    specs = {mamba_name: mamba, target_name: attention}
+    specs.update(dict.fromkeys(draft_names, attention))
+    groups = [
+        KVCacheGroupSpec([mamba_name], mamba),
+        KVCacheGroupSpec([target_name, draft_names[0]], attention),
+        KVCacheGroupSpec(draft_names[1:3], attention),
+        KVCacheGroupSpec(draft_names[3:], attention),
+    ]
+    return config, specs, groups
+
+
+def test_dflash2_prefix_cache_marks_all_draft_groups_without_mamba(monkeypatch):
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_ENABLE_DFLASH2_PREFIX_CACHE", True, raising=False)
+    config, specs, groups = _dflash2_prefix_group_case()
+    kv_cache_utils._annotate_eagle_groups(config, specs, groups)
+
+    # Every draft group needs protection, including mixed target/draft
+    # attention groups. A Mamba-only group must not receive that protection.
+    assert [g.is_eagle_group for g in groups] == [False, True, True, True]
+
+
+def test_dflash2_prefix_cache_preserves_mtp_trailing_layer_rule(monkeypatch):
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_ENABLE_DFLASH2_PREFIX_CACHE", True, raising=False)
+    config, specs, groups = _dflash2_prefix_group_case()
+    config.speculative_config.method = "mtp"
+    kv_cache_utils._annotate_eagle_groups(
+        config, specs, groups, use_trailing_layer_fallback=True
+    )
+    assert [g.is_eagle_group for g in groups] == [False, False, False, True]
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_dflash2_prefix_cache_annotation_survives_hybrid_grouping(monkeypatch, packed):
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_ENABLE_DFLASH2_PREFIX_CACHE", True, raising=False)
+    config, specs, _ = _dflash2_prefix_group_case()
+    config.cache_config.get_resolved_kv_cache_layout = lambda: SimpleNamespace(
+        is_block_outermost=packed
+    )
+    draft_names = {f"model.layers.{i}.self_attn.attn" for i in range(8, 13)}
+    for i, name in enumerate(sorted(draft_names)):
+        specs[name] = (
+            new_kv_cache_spec(dtype=torch.bfloat16)
+            if i < 2
+            else new_sliding_window_spec(dtype=torch.bfloat16)
+        )
+    groups = get_kv_cache_groups(config, specs)
+
+    assert set().union(*(set(g.layer_names) for g in groups)) == set(specs)
+    for group in groups:
+        assert group.is_eagle_group == bool(draft_names.intersection(group.layer_names))
+        if any(
+            isinstance(spec, MambaSpec)
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        ):
+            assert not group.is_eagle_group
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        "disabled",
+        "method",
+        "architecture",
+        "missing_draft",
+        "missing_group_layer",
+        "duplicate_group_layer",
+        "draft_mamba_spec",
+        "mixed_mamba_group",
+        "unknown_namespace",
+        "invalid_count",
+        "drop_disabled",
+    ],
+)
+def test_dflash2_prefix_cache_keeps_ambiguous_layout_fallback(monkeypatch, unsupported):
+    from vllm import envs
+
+    monkeypatch.setattr(
+        envs,
+        "VLLM_ENABLE_DFLASH2_PREFIX_CACHE",
+        unsupported != "disabled",
+        raising=False,
+    )
+    config, specs, groups = _dflash2_prefix_group_case()
+    draft_name = groups[-1].layer_names[-1]
+    if unsupported == "method":
+        config.speculative_config.method = "eagle3"
+    elif unsupported == "architecture":
+        config.speculative_config.draft_model_config.architectures = [
+            "DFlashDraftModel"
+        ]
+    elif unsupported == "missing_draft":
+        del specs[draft_name]
+        groups[-1].layer_names.remove(draft_name)
+    elif unsupported == "missing_group_layer":
+        groups[-1].layer_names.remove(draft_name)
+    elif unsupported == "duplicate_group_layer":
+        groups[-1].layer_names.append(draft_name)
+    elif unsupported == "draft_mamba_spec":
+        specs[draft_name] = new_mamba_spec(mamba_cache_mode="align")
+    elif unsupported == "mixed_mamba_group":
+        groups[-1].layer_names.remove(draft_name)
+        groups[0].layer_names.append(draft_name)
+    elif unsupported == "unknown_namespace":
+        specs["draft." + draft_name] = specs.pop(draft_name)
+        groups[-1].layer_names[-1] = "draft." + draft_name
+    elif unsupported == "invalid_count":
+        config.speculative_config.draft_model_config.hf_config.num_hidden_layers = 0
+    elif unsupported == "drop_disabled":
+        config.speculative_config.use_eagle_block_drop = lambda: False
+
+    kv_cache_utils._annotate_eagle_groups(config, specs, groups)
+    assert not any(group.is_eagle_group for group in groups)
+
+
 def _deepseek_v4_specs(model_version="deepseek_v4"):
     """DeepseekV4-shaped specs: full MLA layers plus sliding-window MLA layers
     at differing page sizes, with the MTP draft layer registered last."""
