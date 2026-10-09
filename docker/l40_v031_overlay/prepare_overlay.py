@@ -71,6 +71,10 @@ def prepare(destination: Path) -> Path:
     )
     for name in recipe_files:
         shutil.copyfile(RECIPE / name, destination / name)
+    shutil.copyfile(
+        REPO / "benchmarks/kernels/l40_fp8_selection_20261009.json",
+        destination / "FP8_SELECTION.json",
+    )
     (destination / "SOURCE.txt").write_text(
         f"Official base: {BASE}\n"
         f"Checkout HEAD: {git('rev-parse', 'HEAD').decode().strip()}\n"
@@ -113,6 +117,7 @@ def prepare(destination: Path) -> Path:
                     "PAYLOAD_SHA256SUMS",
                     "SOURCE.txt",
                     "vllm-v031-l40.patch",
+                    "FP8_SELECTION.json",
                 )
             ),
         ]

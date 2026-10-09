@@ -13,6 +13,8 @@ from pathlib import Path
 MODULES = (
     "envs.py",
     "model_executor/layers/quantization/utils/fp8_utils.py",
+    "model_executor/layers/quantization/utils/l40_fp8_tuned.py",
+    "v1/attention/backends/gdn_attn.py",
     "v1/worker/gpu/model_runner.py",
     "model_executor/warmup/qwen_triton_warmup.py",
     "model_executor/warmup/sm89_warmup.py",

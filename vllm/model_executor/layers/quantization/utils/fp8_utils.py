@@ -13,6 +13,9 @@ import torch
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.l40_fp8_tuned import (
+    get_l40_fp8_tuned_config,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_moe_activation_quant,
     get_fp8_min_max,
@@ -1208,7 +1211,30 @@ def w8a8_triton_block_scaled_mm(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
+    tuned_config = None
+    if envs.VLLM_ENABLE_SM89_FP8_TUNING and current_platform.is_cuda():
+        device_index = A.device.index or 0
+        tuned_config = get_l40_fp8_tuned_config(
+            M,
+            N,
+            K,
+            block_size,
+            enabled=True,
+            is_cuda=True,
+            capability=current_platform.get_device_capability(device_index),
+            device_name=get_device_name_as_file_name(device_index),
+            batch_invariant=envs.VLLM_BATCH_INVARIANT,
+            compatible_dtype=(
+                output_dtype == torch.bfloat16
+                and A.dtype == B.dtype == torch.float8_e4m3fn
+                and As.dtype == Bs.dtype == torch.float32
+            ),
+        )
+    configs = (
+        {M: tuned_config}
+        if tuned_config is not None
+        else get_w8a8_block_fp8_configs(N, K, block_n, block_k)
+    )
     if configs:
         # Get the optimal config if there is one
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
@@ -1228,7 +1254,25 @@ def w8a8_triton_block_scaled_mm(
     # The split kernel deliberately maps one K tile to one quantization block.
     # A tuned JSON config with a different K tile must use the established
     # kernel until it has its own correctness/performance validation.
-    split_k = _get_sm89_split_k_factor(M, N, K, block_size, config=config)
+    split_k = (
+        None
+        if tuned_config is not None
+        else _get_sm89_split_k_factor(M, N, K, block_size, config=config)
+    )
+    if tuned_config is not None:
+        logger.info_once(
+            "L40 FP8 measured config selected: M=%d, N=%d, K=%d, split_k=1, "
+            "tile=(%d,%d,%d), warps=%d, stages=%d. Selection may occur "
+            "during warmup/capture; this is not an invocation counter.",
+            M,
+            N,
+            K,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["num_warps"],
+            config["num_stages"],
+        )
     if split_k is not None:
         logger.info_once(
             "SM89 FP8 split-K selected: M=%d, N=%d, K=%d, split_k=%d, "

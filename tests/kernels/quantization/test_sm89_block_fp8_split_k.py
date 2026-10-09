@@ -5,11 +5,141 @@ import pytest
 import torch
 
 from tests.kernels.quant_utils import native_w8a8_block_matmul
+from vllm.model_executor.layers.quantization.utils import fp8_utils
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _get_sm89_split_k_factor,
     _run_w8a8_triton_block_scaled_mm_split_k,
 )
+from vllm.model_executor.layers.quantization.utils.l40_fp8_tuned import (
+    get_l40_fp8_tuned_config,
+)
 from vllm.platforms import current_platform
+
+
+def test_measured_l40_config_is_exact_and_does_not_extrapolate():
+    options = dict(
+        enabled=True,
+        is_cuda=True,
+        capability=(8, 9),
+        device_name="NVIDIA_L40",
+        batch_invariant=False,
+        compatible_dtype=True,
+    )
+    config = get_l40_fp8_tuned_config(4, 5120, 8704, [128, 128], **options)
+    assert config is not None
+    assert config["BLOCK_SIZE_M"] == 16 and config["BLOCK_SIZE_N"] == 32
+    config["BLOCK_SIZE_N"] = 999
+    assert (
+        get_l40_fp8_tuned_config(4, 5120, 8704, [128, 128], **options)["BLOCK_SIZE_N"]
+        == 32
+    )
+    for M, N, K in [
+        (3, 5120, 8704),
+        (33, 5120, 8704),
+        (8192, 5120, 8704),
+        (4, 5120, 5120),
+    ]:
+        assert get_l40_fp8_tuned_config(M, N, K, [128, 128], **options) is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"enabled": False},
+        {"is_cuda": False},
+        {"capability": (9, 0)},
+        {"device_name": "NVIDIA_L40S"},
+        {"batch_invariant": True},
+        {"compatible_dtype": False},
+    ],
+)
+def test_measured_l40_config_preserves_other_execution_modes(override):
+    options = dict(
+        enabled=True,
+        is_cuda=True,
+        capability=(8, 9),
+        device_name="NVIDIA_L40",
+        batch_invariant=False,
+        compatible_dtype=True,
+    )
+    options.update(override)
+    assert get_l40_fp8_tuned_config(4, 5120, 8704, [128, 128], **options) is None
+
+
+@pytest.mark.parametrize(
+    "tuning_enabled,output_dtype,M,device_name,expected",
+    [
+        (True, torch.bfloat16, 4, "NVIDIA_L40", [("ordinary", 32)]),
+        (False, torch.bfloat16, 4, "NVIDIA_L40", [("split", 4)]),
+        (True, torch.float16, 4, "NVIDIA_L40", [("split", 4)]),
+        (True, torch.bfloat16, 3, "NVIDIA_L40", [("split", 4)]),
+        (True, torch.bfloat16, 4, "NVIDIA_L40S", [("split", 4)]),
+    ],
+)
+def test_measured_tile_dispatch_overrides_split_k_only_when_enabled(
+    monkeypatch,
+    tuning_enabled,
+    output_dtype,
+    M,
+    device_name,
+    expected,
+):
+    calls = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def run(*args, **kwargs):
+                calls.append(("ordinary", kwargs["BLOCK_SIZE_N"]))
+
+            return run
+
+    monkeypatch.setattr(
+        fp8_utils.envs, "VLLM_ENABLE_SM89_FP8_TUNING", tuning_enabled, raising=False
+    )
+    monkeypatch.setattr(
+        fp8_utils.envs, "VLLM_ENABLE_SM89_FP8_SPLIT_K", True, raising=False
+    )
+    monkeypatch.setattr(fp8_utils.envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "get_device_capability", lambda device_id=0: (8, 9)
+    )
+    monkeypatch.setattr(
+        fp8_utils,
+        "get_device_name_as_file_name",
+        lambda device_id=0: device_name if device_id == 1 else "NVIDIA_L40",
+    )
+    monkeypatch.setattr(fp8_utils, "get_w8a8_block_fp8_configs", lambda *args: None)
+    monkeypatch.setattr(fp8_utils, "_w8a8_triton_block_scaled_mm", Kernel())
+    monkeypatch.setattr(
+        fp8_utils,
+        "_run_w8a8_triton_block_scaled_mm_split_k",
+        lambda *args: calls.append(("split", args[-1])),
+    )
+
+    class NonzeroDeviceInput:
+        device = torch.device("cuda:1")
+
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def __getattr__(self, name):
+            return getattr(self.tensor, name)
+
+    A = NonzeroDeviceInput(torch.empty((M, 8704), dtype=torch.float8_e4m3fn))
+    B = torch.empty((5120, 8704), dtype=torch.float8_e4m3fn)
+    As = torch.empty((M, 68))
+    Bs = torch.empty((40, 68))
+    output = fp8_utils.w8a8_triton_block_scaled_mm(
+        A,
+        B,
+        As,
+        Bs,
+        [128, 128],
+        output_dtype=output_dtype,
+    )
+    assert output.shape == (M, 5120)
+    assert calls == expected
 
 
 @pytest.mark.parametrize(
