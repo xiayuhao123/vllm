@@ -65,6 +65,26 @@ GDN_BUILD_TEST_CASES = {
         expected_num_prefill_tokens=0,
         expected_num_spec_decodes=2,
     ),
+    "pure_spec_decode_with_padding": GDNBuildTestCase(
+        seq_lens=[50, 30, 0],
+        query_lens=[3, 3, 0],
+        num_decode_draft_tokens=[2, 2, -1],
+        num_speculative_tokens=2,
+        expected_num_decodes=0,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=2,
+    ),
+    "ragged_spec_decode_with_padding": GDNBuildTestCase(
+        seq_lens=[50, 30, 0],
+        query_lens=[3, 2, 0],
+        num_decode_draft_tokens=[2, 1, -1],
+        num_speculative_tokens=2,
+        expected_num_decodes=0,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=2,
+    ),
     # No speculative config at all — standard decode path
     "pure_regular_decode": GDNBuildTestCase(
         seq_lens=[40, 30, 20],
@@ -143,8 +163,9 @@ def _create_gdn_builder(
         model_name="Qwen/Qwen3.5-0.8B",
         block_size=BLOCK_SIZE,
     )
-    if full_cuda_graph:
-        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    vllm_config.compilation_config.cudagraph_mode = (
+        CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
+    )
     if num_speculative_tokens > 0:
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",
@@ -284,6 +305,38 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+@pytest.mark.parametrize("query_lens", [[4, 4], [4, 4, 0], [4, 2, 0]])
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+def test_pure_spec_metadata_slices_active_rows_without_gather(query_lens, cache_mode):
+    """Pure decode must share storage with the input and exclude padded rows."""
+    builder = _create_gdn_builder(3)
+    builder.vllm_config.cache_config.mamba_cache_mode = cache_mode
+    num_reqs = len(query_lens)
+    batch = BatchSpec(seq_lens=[80] * num_reqs, query_lens=query_lens)
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    states = torch.arange(num_reqs * 4, dtype=torch.int32).view(num_reqs, 4)
+    if cache_mode == "align":
+        builder.mamba_aligned_state_indices = states
+    else:
+        common = common.replace(block_table_tensor=states)
+    accepted = torch.tensor([2, 1, 7][:num_reqs], dtype=torch.int32)
+    draft = torch.tensor([length - 1 for length in query_lens], dtype=torch.int32)
+    meta = builder.build(0, common, accepted, draft)
+    assert meta.num_spec_decodes == 2
+    torch.testing.assert_close(meta.spec_state_indices_tensor, states[:2])
+    torch.testing.assert_close(meta.num_accepted_tokens, accepted[:2])
+    assert meta.spec_state_indices_tensor.data_ptr() == states.data_ptr()
+    assert meta.num_accepted_tokens.data_ptr() == accepted.data_ptr()
+
+    other_states = states + 100
+    if cache_mode == "align":
+        builder.mamba_aligned_state_indices = other_states
+    updated = builder.update_block_table(meta, other_states, common.slot_mapping)
+    torch.testing.assert_close(updated.spec_state_indices_tensor, other_states[:2])
+    assert updated.spec_state_indices_tensor.data_ptr() == other_states.data_ptr()
+    torch.testing.assert_close(meta.spec_state_indices_tensor, states[:2])
 
 
 def _build_non_spec(
